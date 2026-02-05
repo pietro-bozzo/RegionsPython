@@ -1,0 +1,299 @@
+from pathlib import Path
+import fmatoolbox.data
+import numpy as np
+import regions.computation
+import regions.loaders
+
+
+class Regions:
+    # Handler for multi-region spiking data, stores session metadata and provides access to computed quantities
+
+    def __init__(self,session,ids=None,phases=None,states=None,events=None,load_spikes=True):
+        # construct a Regions object
+        #
+        # arguments:
+        #     session        string, path to session .xml file
+        #     ids            (:) string = None, regions to load (default is all recorded regions)
+        #     phases         (:) string = None, session phases to load from <basename>.cat.evt file
+        #     states         (:) string = None, behavioral states to load (they correspond to extensions of files to load)
+        #     events         (:) string = None, additional events to load (they correspond to extensions of files to load)
+        #     load_spikes    bool = True, load spikes (False allows to access events without costly spike loading)
+
+        self.session = Path(session).parent
+        self.basename = Path(session).name
+
+        # 1. load events
+        self.all_events = phases is None
+        if states is None:
+            states = []
+        if events is None:
+            events = []
+        loaded_events = fmatoolbox.data.loadEvents(session,extra=states+events)
+        # find session phases, if any
+        phase_names = [name for name in loaded_events.keys() if name not in states and name not in events]
+
+        if phases:
+            indices = [phase_names.index(p) for p in phases if p in phase_names]
+            unknown = set(events) - set(phase_names)
+            if unknown:
+                print(f'Warning: missing events: {unknown}')
+            self.phases = {phase_names[i] : loaded_events[phase_names[i]] for i in indices}
+        else:
+            self.phases = {name : loaded_events[name] for name in phase_names}
+
+        # 2. assign states
+        self.states = {}
+        for name in states:
+            if name not in loaded_events:
+                raise(ValueError(f'Unable to load {self.basename}.{name}'))
+            self.states[name] = loaded_events[name]
+        # if session phases are available, use them to compute special states 'all' and 'other'
+        if phase_names:
+            self.states['all'] = np.array([[self.phases[list(self.phases)[0]][0,0],self.phases[list(self.phases)[-1]][-1,-1]]])
+            self.states['other'] = self.states['all']
+            for name in states:
+                self.states['other'] = fmatoolbox.general.subtractIntervals(self.states['other'],self.states[name])
+
+        # 3. assign events
+        self.events = {}
+        if events:
+            for name in events:
+                e = loaded_events[name]
+                # special reordering for ripples and spindles
+                if name in ['ripples','spindles']:
+                    e = e[:,[0,2,1]+list(range(3,e.shape[1]))]
+                self.events[name] = e
+
+        if ids:
+            self.ids = list(dict.fromkeys(ids))
+            self.region = {id : {} for id in ids}
+        else:
+            self.ids = ids
+            self.region = {}
+
+        # 4. load spikes and store them per region
+        if load_spikes:
+        
+            spikes, electrodes = fmatoolbox.data.loadSpikeTimes(session,return_elec=True)
+            anat = regions.loaders.loadAnatomyFile()
+            anat = anat[anat['rat'] == int(self.basename[3:6])]
+
+            if ids:
+                anat = anat[np.isin(anat['region'],ids)]
+            else:
+                self.ids = ids = np.unique(anat['region'])
+                self.region = {id : {} for id in ids}
+
+            units = np.fromiter(spikes.keys(),int)
+            for id in ids:
+                self.region[id]['units'] = []
+                s = []
+                for electrode in anat[anat['region']==id]['electrode']:
+                    electrode_units = units[electrodes==electrode]
+                    self.region[id]['units'].append(electrode_units)
+                    for unit in electrode_units:
+                        s.append(np.array([spikes[unit],[unit]*spikes[unit].size]).T)
+                # assing spikes, sorted by time
+                s = np.concatenate(s)
+                self.region[id]['spikes'] = s[s[:,0].argsort()]
+                self.region[id]['units'] = np.concatenate(self.region[id]['units'])
+
+        return
+    
+
+    ## validation functions ##
+
+    def _checkIDs(self,regs=None,states=None,fuse=False):
+        # validate that regions and states are loaded in self
+        #
+        # arguments:
+        #     regs      (:) string = None, brain regions, default is all loaded regions
+        #     states    (:) string = None, behavioral states, default depends on fuse
+        #     fuse      bool = False, if True, default states is 'all', else it is all other states
+        #
+        # output:
+        #     regs      (:) string, unique regs (preserving order)
+        #     states    (:) string, unique states (preserving order)
+
+        # default: all regions
+        if regs is None:
+            regs = self.ids
+        else:
+        # return unique regs
+            regs = np.array(regs).flatten()
+            if not np.isin(regs,self.ids).all():
+                raise(ValueError(f'Unrecognized region'))
+            _, idx = np.unique(regs,return_index=True)
+            regs = regs[np.sort(idx)]
+
+        # default:
+        if states is None:
+            # 'all' if fuse
+            if fuse or len(self.states.keys()) == 2:
+                states = np.array(['all'])
+            # all states otherwise
+            else:
+                states = np.array(list(self.states))
+                states = states[states != 'all']
+        # return unique states
+        else:
+            states = np.array(states).flatten()
+            if not np.isin(states,list(self.states.keys())).all():
+                raise(ValueError(f'Unrecognized state'))
+            _, idx = np.unique(states,return_index=True)
+            states = states[np.sort(idx)]
+
+        return regs, states
+    
+
+    ## getters with minimal processing ##
+
+    def eventIntervals(self,events=None):
+        # get [start, stop] intervals (s) for a union and/or intersection of events
+        #
+        # arguments:
+        #     events       (n) list of (:) string, each element is a list of events, to compute intervals:
+        #                    1. intervals corresponding to names from each list inside 'events' are united, yielding n interval sets
+        #                    2. output is intersection between this n sets
+        #                  e. g., events = [['rem','sws'],['sleep1']]
+        #                    1. 'rem' and 'sws' intervals are united (a), 'sleep1' is unchanged (b)
+        #                    2. intersection between (a) and (b) is output
+        #
+        # output:
+        #     intervals    (:,2) double, each row is a [start, stop] interval (s)
+
+        # default output
+        if events is None:
+            intervals = np.concatenate(list(self.phases.values()))
+
+        # list of events
+        else:
+
+            # promote single string to 2d array
+            if isinstance(events,str):
+                events = np.array(events,ndmin=2)
+
+            # events is a list of lists of event names
+            intervals = []
+            for ev in events:
+                # 1. union of all intervals in ev
+                ev = np.array(ev)
+                if ev.ndim == 0:
+                    raise ValueError("'events' must be like a list of lists of strings")
+                interv = [self.phases[e][:,:2] for e in ev if e in self.phases]
+                [interv.append(self.states[e][:,:2]) for e in ev if e in self.states]
+                [interv.append(self.events[e][:,:2]) for e in ev if e in self.events]
+                if len(interv) == 0:
+                    raise ValueError(f"None of the following was found: {ev}")
+                intervals.append(fmatoolbox.general.consolidateIntervals(np.concatenate(interv)))
+            # 2. intersection across different evs
+            intervals = fmatoolbox.general.intersectIntervals(intervals)
+                
+        return intervals
+    
+
+    def units(self,regs=None):
+        # get pooled list of units for regions
+        #
+        # arguments:
+        #     regs     (:) string, units of all these regions are returned as an array
+        #
+        # output:
+        #     units    (:) int
+
+        regs, _ = self._checkIDs(regs)
+
+        units = []
+        for r in regs:
+            units.append(self.region[r]['units'])
+
+        return np.concatenate(units)
+
+
+    def spikes(self,regs=None,state=None):
+        # get pooled spikes for regions
+        #
+        # arguments:
+        #     regs      (:) string, spikes of all these regions are returned as a time-sorted array
+        #     state     string = None, behavioral to restrict spikes to
+        #
+        # output:
+        #     spikes    (:) float, each row is [spike time (s), unit id]
+
+        regs, state = self._checkIDs(regs,state,fuse=True)
+        if state.size != 1:
+            raise(ValueError('Only one state can be provided'))
+
+        spikes = []
+        for r in regs:
+            spikes.append(self.region[r]['spikes'])
+        spikes = np.concatenate(spikes)
+        spikes = spikes[spikes[:,0].argsort()]
+
+        if state != 'all':
+            spikes = fmatoolbox.general.restrict(spikes,self.states[state[0]])
+
+        return spikes
+    
+
+    ## functions to compute quantities ##
+
+    def firingRate(self,regs=None,states=None,window=0.05,step=1,smooth=None):
+        # get region firing rate
+
+        regs, states = self._checkIDs(regs,states,fuse=True)
+
+        # operate per session phase
+        phase_intervals = fmatoolbox.general.consolidateIntervals(self.eventIntervals(),epsilon=0.00001)
+        firing_rate = []
+        time = []
+        for interval in phase_intervals:
+            fr_interv = []
+            for r in regs:
+                fr = fmatoolbox.analysis.firingRate(self.spikes(r)[:,0],interval[0],interval[1],window,step,smooth)
+                fr_interv.append(fr[:,1])
+            firing_rate.append(np.stack(fr_interv,1))
+            time.append(fr[:,0])
+        firing_rate = np.concatenate((np.concatenate(time).reshape((-1,1)),np.concatenate(firing_rate)),1)
+
+        # filter by state
+        firing_rate = fmatoolbox.general.restrict(firing_rate,self.eventIntervals([states]))
+
+        return firing_rate
+    
+
+    def unitFiringRate(self,regs=None,states=None,window=0.05,step=1,smooth=None):
+        # get units' firing rate
+
+        regs, states = self._checkIDs(regs,states,fuse=True)
+
+        # operate per session phase
+        phase_intervals = fmatoolbox.general.consolidateIntervals(self.eventIntervals(),epsilon=0.00001)
+        n_times = np.concatenate(([0],np.cumsum(np.ceil(np.diff(phase_intervals,1)*step/window)).astype(int)))
+        n_units = np.cumsum(np.concatenate(([1],[self.units(r).size for r in regs])))
+        firing_rate = np.zeros((n_times[-1],n_units[-1]))
+        for i, interval in enumerate(phase_intervals):
+            for j, r in enumerate(regs):
+                fr = fmatoolbox.analysis.firingRate(self.spikes(r),interval[0],interval[1],window,step,smooth)
+                firing_rate[n_times[i]:n_times[i+1],n_units[j]:n_units[j+1]] = fr[:,1:]
+            firing_rate[n_times[i]:n_times[i+1],0] = fr[:,0]
+
+        # filter by state
+        firing_rate = fmatoolbox.general.restrict(firing_rate,self.eventIntervals([states]))
+
+        return firing_rate
+    
+
+    def avalanches(self,regs=None,states=None,thresh=30,window=0.05,step=1,smooth=None):
+        # compute avalanches per region from population firing rate
+
+        regs, states = self._checkIDs(regs,states,fuse=True)
+
+        fr = self.firingRate(regs,states,window,step,smooth)
+        size = {}
+        intervals = {}
+        size_t = {}
+        for i, r in enumerate(regs):
+            size[r], intervals[r], size_t[r] = regions.computation.avalanchesFromProfile(fr[:,i+1],thresh,time_step=fr[1,0]-fr[0,0],t0=fr[0,0])
+
+        return size, intervals, size_t
